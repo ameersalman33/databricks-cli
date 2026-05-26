@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/databricks/cli/libs/auth"
 	"github.com/databricks/cli/libs/cmdctx"
@@ -238,6 +240,53 @@ func workspaceClientOrPrompt(ctx context.Context, cfg *config.Config, allowPromp
 	return w, err
 }
 
+// lakeguardHostForProfile returns the value of the optional `lakeguard` field
+// in the named profile, or "" if absent. Used by MustWorkspaceClient to route
+// API requests through a gateway URL while authentication flows continue to
+// use the workspace `host`.
+func lakeguardHostForProfile(ctx context.Context, profileName string) string {
+	if profileName == "" {
+		return ""
+	}
+	f, err := profile.DefaultProfiler.Get(ctx)
+	if err != nil {
+		return ""
+	}
+	s, err := f.GetSection(profileName)
+	if err != nil || s == nil {
+		return ""
+	}
+	return s.Key("lakeguard").String()
+}
+
+// lakeguardTransport is a path-routing http.RoundTripper. Requests whose path
+// starts with /api/ are rewritten to send their traffic to the LakeGuard
+// gateway host; everything else (OAuth /oidc/* paths, OIDC discovery at
+// /.well-known/*, etc.) is forwarded unchanged so authentication continues to
+// use the workspace `host` configured on the profile.
+//
+// This is the mechanism that lets a single .databrickscfg profile point OAuth
+// at the real workspace while routing data-plane traffic through LakeGuard,
+// without any changes to databricks-sdk-go.
+type lakeguardTransport struct {
+	lakeguardHost string // URL like https://lakeguard-<id>.cloud.databricksapps.com
+	inner         http.RoundTripper
+}
+
+func (t *lakeguardTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Only rewrite API paths. OAuth and metadata discovery must reach the
+	// real workspace host the SDK built the request against.
+	if req.URL != nil && strings.HasPrefix(req.URL.Path, "/api/") {
+		if u, err := url.Parse(t.lakeguardHost); err == nil && u.Host != "" {
+			req = req.Clone(req.Context())
+			req.URL.Host = u.Host
+			req.URL.Scheme = u.Scheme
+			req.Host = u.Host
+		}
+	}
+	return t.inner.RoundTrip(req)
+}
+
 func MustWorkspaceClient(cmd *cobra.Command, args []string) error {
 	ctx := logdiag.InitContext(cmd.Context())
 	cmd.SetContext(ctx)
@@ -279,6 +328,19 @@ func MustWorkspaceClient(cmd *cobra.Command, args []string) error {
 			}
 			cfg = client.Config
 		}
+	}
+
+	// If the profile defines a `lakeguard` field, install a custom
+	// http.RoundTripper that path-routes API traffic to the LakeGuard
+	// gateway while OAuth flows continue to use the workspace `host`.
+	// This works for U2M, OAuth M2M, and PAT auth alike because the
+	// transport routes based on the URL path, not the credential type.
+	if v := lakeguardHostForProfile(cmd.Context(), cfg.Profile); v != "" {
+		inner := cfg.HTTPTransport
+		if inner == nil {
+			inner = http.DefaultTransport
+		}
+		cfg.HTTPTransport = &lakeguardTransport{lakeguardHost: v, inner: inner}
 	}
 
 	allowPrompt := !hasProfileFlag && !shouldSkipPrompt(cmd.Context())
